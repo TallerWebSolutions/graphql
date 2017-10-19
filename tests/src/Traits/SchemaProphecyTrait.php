@@ -44,7 +44,7 @@ trait SchemaProphecyTrait {
    *   The empty schema plugin.
    */
   protected function createSchema(AbstractField $field = NULL) {
-    return TestSchema::create($this->container, $field);
+    return TestSchema::create($field);
   }
 
   /**
@@ -75,7 +75,7 @@ trait SchemaProphecyTrait {
    *   The container builder.
    */
   protected function injectSchemaManager(ContainerBuilder $container) {
-    $defaultSchemaDefinition = TestSchema::configuration();
+    $defaultSchemaDefinition = TestSchema::pluginDefinition();
 
     $this->schemaManager = $this->prophesize(SchemaPluginManager::class);
     $this->schemaManager->getDefinitions()->willReturn([
