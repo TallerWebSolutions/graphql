@@ -42,7 +42,7 @@ class DeferredResult extends OriginalDeferredResult {
     $this->originalCallback = $callback;
     parent::__construct($resolver, function($result) {
       if ($result instanceof CacheableDependencyInterface) {
-        $this->metadata->addCacheableDependency($this);
+        $this->metadata->addCacheableDependency($result);
       }
 
       if ($result instanceof CacheableValue) {
