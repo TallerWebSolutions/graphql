@@ -1,0 +1,480 @@
+From 67fdf16ba363fbecbdba0d1dbd39ceb4ede3f7b7 Mon Sep 17 00:00:00 2001
+From: Philipp Melab <philipp.melab@gmail.com>
+Date: Thu, 26 Apr 2018 13:50:00 +0200
+Subject: [PATCH 1/3] Reverted cache handling. Don't try to predict contexts
+ any more.
+
+---
+ src/GraphQL/Execution/QueryProcessor.php        | 62 +++++++++++++------------
+ src/GraphQL/Visitors/CacheContextsCollector.php | 56 ----------------------
+ 2 files changed, 33 insertions(+), 85 deletions(-)
+ delete mode 100644 src/GraphQL/Visitors/CacheContextsCollector.php
+
+diff --git a/src/GraphQL/Execution/QueryProcessor.php b/src/GraphQL/Execution/QueryProcessor.php
+index 50733619..a8c99867 100644
+--- a/src/GraphQL/Execution/QueryProcessor.php
++++ b/src/GraphQL/Execution/QueryProcessor.php
+@@ -7,7 +7,6 @@
+ use Drupal\Core\Cache\CacheBackendInterface;
+ use Drupal\Core\Cache\Context\CacheContextsManager;
+ use Drupal\Core\Session\AccountProxyInterface;
+-use Drupal\graphql\GraphQL\Visitors\CacheContextsCollector;
+ use Drupal\graphql\Plugin\SchemaPluginManager;
+ use Drupal\graphql\GraphQL\QueryProvider\QueryProviderInterface;
+ use GraphQL\Error\Error;
+@@ -293,37 +292,24 @@ protected function executeOperation(PromiseAdapter $adapter, ServerConfig $confi
+    * @return \GraphQL\Executor\Promise\Promise|mixed
+    */
+   protected function executeCacheableOperation(PromiseAdapter $adapter, ServerConfig $config, OperationParams $params, DocumentNode $document) {
+-    $schema = $config->getSchema();
++    $contextCacheId = $this->cacheIdentifier($params, $document, new CacheableMetadata());
+ 
+-    // Collect cache contexts from the query document.
+-    $contexts = [];
+-    $info = new TypeInfo($schema);
+-    $visitor = (new CacheContextsCollector())->getVisitor($info, $contexts);
+-    Visitor::visit($document, Visitor::visitWithTypeInfo($info, $visitor));
+-
+-    // Generate a cache identifier from the collected contexts.
+-    $metadata = (new CacheableMetadata())->addCacheContexts($contexts);
+-    $cid = $this->cacheIdentifier($params, $document, $metadata);
+-    if (!$config->getDebug() && ($cache = $this->cacheBackend->get($cid)) && $result = $cache->data) {
+-      return $adapter->createFulfilled($result);
++    if (!$config->getDebug() && ($contextCache = $this->cacheBackend->get($contextCacheId)) && $contexts = $contextCache->data) {
++      $cacheId = $this->cacheIdentifier($params, $document, (new CacheableMetadata())->addCacheContexts($contexts));
++      if (($cache = $this->cacheBackend->get($cacheId)) && $result = $cache->data) {
++        return $adapter->createFulfilled($result);
++      }
+     }
+ 
+     $result = $this->doExecuteOperation($adapter, $config, $params, $document);
+-    return $result->then(function (QueryResult $result) use ($cid, $metadata) {
+-      if ($missing = array_diff($result->getCacheContexts(), $metadata->getCacheContexts())) {
+-        throw new \LogicException(sprintf(
+-          'The query result yielded cache contexts (%s) that were not part of the static query analysis.',
+-          implode(', ', $missing)
+-        ));
+-      }
+ 
+-      // Add the statically collected cache contexts.
+-      $result->addCacheableDependency($metadata);
++    return $result->then(function (QueryResult $result) use ($contextCacheId, $params, $document) {
+       // Write this query into the cache if it is cacheable.
+       if ($result->getCacheMaxAge() !== 0) {
+-        $this->cacheBackend->set($cid, $result, $result->getCacheMaxAge(), $result->getCacheTags());
++        $cacheId = $this->cacheIdentifier($params, $document, (new CacheableMetadata())->addCacheContexts($result->getCacheContexts()));
++        $this->cacheBackend->set($contextCacheId, $result->getCacheContexts(), $result->getCacheMaxAge(), $result->getCacheTags());
++        $this->cacheBackend->set($cacheId, $result, $result->getCacheMaxAge(), $result->getCacheTags());
+       }
+-
+       return $result;
+     });
+   }
+@@ -373,8 +359,11 @@ protected function doExecuteOperation(PromiseAdapter $adapter, ServerConfig $con
+     );
+ 
+     return $promise->then(function (ExecutionResult $result) use ($context) {
+-      // Add the collected cache metadata to the result.
+-      $metadata = (new CacheableMetadata())->addCacheableDependency($context);
++
++      $metadata = (new CacheableMetadata())
++        ->addCacheContexts($this->filterCacheContexts($context->getCacheContexts()))
++        ->addCacheTags($context->getCacheTags())
++        ->setCacheMaxAge($context->getCacheMaxAge());
+ 
+       // Do not cache in development mode or if there are any errors.
+       if ($context->getGlobal('development') || !empty($result->errors)) {
+@@ -536,9 +525,7 @@ protected function sanitizeRecursive(array $item) {
+    */
+   protected function cacheIdentifier(OperationParams $params, DocumentNode $document, CacheableMetadata $metadata) {
+     // Ignore language contexts since they are handled by graphql internally.
+-    $contexts = array_filter($metadata->getCacheContexts(), function ($context) {
+-      return strpos($context, 'languages:') !== 0;
+-    });
++    $contexts = $this->filterCacheContexts($metadata->getCacheContexts());
+     $keys = $this->contextsManager->convertTokensToKeys($contexts)->getKeys();
+ 
+     // Sorting the variables will cause fewer cache vectors.
+@@ -553,4 +540,21 @@ protected function cacheIdentifier(OperationParams $params, DocumentNode $docume
+ 
+     return implode(':', array_values(array_merge([$hash], $keys)));
+   }
++
++  /**
++   * Filter unused contexts.
++   *
++   * Removes the language contexts from a list of context ids.
++   *
++   * @param string[] $contexts
++   *   The list of context id's.
++   *
++   * @return string[]
++   *   The filtered list of context id's.
++   */
++  protected function filterCacheContexts(array $contexts) {
++    return array_filter($contexts, function ($context) {
++      return strpos($context, 'languages:') !== 0;
++    });
++  }
+ }
+diff --git a/src/GraphQL/Visitors/CacheContextsCollector.php b/src/GraphQL/Visitors/CacheContextsCollector.php
+deleted file mode 100644
+index d0e594ba..00000000
+--- a/src/GraphQL/Visitors/CacheContextsCollector.php
++++ /dev/null
+@@ -1,56 +0,0 @@
+-<?php
+-
+-namespace Drupal\graphql\GraphQL\Visitors;
+-
+-use Drupal\Core\Cache\Cache;
+-use GraphQL\Language\AST\FieldNode;
+-use GraphQL\Language\AST\NodeKind;
+-use GraphQL\Type\Definition\LeafType;
+-use GraphQL\Utils\TypeInfo;
+-
+-class CacheContextsCollector {
+-
+-  /**
+-   * {@inheritdoc}
+-   */
+-  public function getVisitor(TypeInfo $info, array &$contexts) {
+-    return [
+-      NodeKind::FIELD => [
+-        'leave' => function (FieldNode $field) use ($info, &$contexts) {
+-          $definition = $info->getFieldDef();
+-          if (!empty($definition->config['contexts'])) {
+-            $contexts = Cache::mergeContexts($contexts, $this->collectCacheContexts($definition->config['contexts']));
+-          }
+-
+-          $parent = $info->getParentType();
+-          if (!empty($parent->config['contexts'])) {
+-            $contexts = Cache::mergeContexts($contexts, $this->collectCacheContexts($parent->config['contexts']));
+-          }
+-
+-          $type = $info->getType();
+-          // Collect cache metadata from leaf types.
+-          if ($type instanceof LeafType && !empty($type->config['contexts'])) {
+-            $contexts = Cache::mergeContexts($contexts, $this->collectCacheContexts($type->config['contexts']));
+-          }
+-        },
+-      ],
+-    ];
+-  }
+-
+-  /**
+-   * Collects the cache contexts from a type or field config.
+-   *
+-   * @param array|callable $contexts
+-   *   The cache contexts array or a callable to return cache contexts.
+-   *
+-   * @return array
+-   *   The collected cache contexts.
+-   */
+-  protected function collectCacheContexts($contexts) {
+-    if (is_callable($contexts)) {
+-      $contexts = $contexts();
+-    }
+-    return $contexts;
+-  }
+-
+-}
+
+From 0df40f371f97ea3f1d847326a13499b7a3ce54b0 Mon Sep 17 00:00:00 2001
+From: Philipp Melab <philipp.melab@gmail.com>
+Date: Thu, 26 Apr 2018 14:59:37 +0200
+Subject: [PATCH 2/3] Fixed cache keys.
+
+---
+ src/GraphQL/Execution/QueryProcessor.php | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/GraphQL/Execution/QueryProcessor.php b/src/GraphQL/Execution/QueryProcessor.php
+index a8c99867..260230b9 100644
+--- a/src/GraphQL/Execution/QueryProcessor.php
++++ b/src/GraphQL/Execution/QueryProcessor.php
+@@ -292,10 +292,10 @@ protected function executeOperation(PromiseAdapter $adapter, ServerConfig $confi
+    * @return \GraphQL\Executor\Promise\Promise|mixed
+    */
+   protected function executeCacheableOperation(PromiseAdapter $adapter, ServerConfig $config, OperationParams $params, DocumentNode $document) {
+-    $contextCacheId = $this->cacheIdentifier($params, $document, new CacheableMetadata());
++    $contextCacheId = 'ccid:' . $this->cacheIdentifier($params, $document, new CacheableMetadata());
+ 
+     if (!$config->getDebug() && ($contextCache = $this->cacheBackend->get($contextCacheId)) && $contexts = $contextCache->data) {
+-      $cacheId = $this->cacheIdentifier($params, $document, (new CacheableMetadata())->addCacheContexts($contexts));
++      $cacheId = 'cid:' . $this->cacheIdentifier($params, $document, (new CacheableMetadata())->addCacheContexts($contexts));
+       if (($cache = $this->cacheBackend->get($cacheId)) && $result = $cache->data) {
+         return $adapter->createFulfilled($result);
+       }
+@@ -306,7 +306,7 @@ protected function executeCacheableOperation(PromiseAdapter $adapter, ServerConf
+     return $result->then(function (QueryResult $result) use ($contextCacheId, $params, $document) {
+       // Write this query into the cache if it is cacheable.
+       if ($result->getCacheMaxAge() !== 0) {
+-        $cacheId = $this->cacheIdentifier($params, $document, (new CacheableMetadata())->addCacheContexts($result->getCacheContexts()));
++        $cacheId = 'cid:' . $this->cacheIdentifier($params, $document, (new CacheableMetadata())->addCacheContexts($result->getCacheContexts()));
+         $this->cacheBackend->set($contextCacheId, $result->getCacheContexts(), $result->getCacheMaxAge(), $result->getCacheTags());
+         $this->cacheBackend->set($cacheId, $result, $result->getCacheMaxAge(), $result->getCacheTags());
+       }
+
+From ebac3fb4b77eaaaaa0ea566f38c806f70e7ce684 Mon Sep 17 00:00:00 2001
+From: Philipp Melab <philipp.melab@gmail.com>
+Date: Thu, 26 Apr 2018 14:59:59 +0200
+Subject: [PATCH 3/3] Adapted tests.
+
+---
+ .../tests/src/Kernel/Blocks/BlockTest.php          |  4 ---
+ .../tests/src/Kernel/Entity/EntityByIdTest.php     |  2 --
+ .../src/Kernel/Entity/EntityFieldValueTest.php     | 21 --------------
+ .../tests/src/Kernel/Images/ImageFieldTest.php     |  6 ----
+ .../tests/src/Kernel/Languages/LanguageTest.php    |  5 ----
+ .../tests/src/Kernel/Menu/MenuTest.php             |  5 ----
+ .../tests/src/Kernel/Routing/RouteEntityTest.php   |  5 ----
+ tests/src/Kernel/Framework/LanguageContextTest.php | 32 ++--------------------
+ tests/src/Kernel/Framework/SecureFieldTest.php     |  7 +++--
+ 9 files changed, 8 insertions(+), 79 deletions(-)
+
+diff --git a/modules/graphql_core/tests/src/Kernel/Blocks/BlockTest.php b/modules/graphql_core/tests/src/Kernel/Blocks/BlockTest.php
+index 431d48ad..905ee4b3 100644
+--- a/modules/graphql_core/tests/src/Kernel/Blocks/BlockTest.php
++++ b/modules/graphql_core/tests/src/Kernel/Blocks/BlockTest.php
+@@ -76,10 +76,6 @@ public function testStaticBlocks() {
+       'entity_field_info',
+     ]);
+ 
+-    $metadata->addCacheContexts([
+-      'languages:language_interface',
+-    ]);
+-
+     $this->assertResults($query, [], [
+       'route' => [
+         'content' => [
+diff --git a/modules/graphql_core/tests/src/Kernel/Entity/EntityByIdTest.php b/modules/graphql_core/tests/src/Kernel/Entity/EntityByIdTest.php
+index 3ba7bbcf..bb505dc8 100644
+--- a/modules/graphql_core/tests/src/Kernel/Entity/EntityByIdTest.php
++++ b/modules/graphql_core/tests/src/Kernel/Entity/EntityByIdTest.php
+@@ -66,8 +66,6 @@ public function testEntityByIdWithTranslation() {
+       'node:1',
+     ]);
+ 
+-    $metadata->addCacheContexts(['user.node_grants:view']);
+-
+     // Check English node.
+     $this->assertResults($this->getQueryFromFile('entity_by_id.gql'), [
+       'id' => $node->id(),
+diff --git a/modules/graphql_core/tests/src/Kernel/Entity/EntityFieldValueTest.php b/modules/graphql_core/tests/src/Kernel/Entity/EntityFieldValueTest.php
+index 6903b133..8435f58a 100644
+--- a/modules/graphql_core/tests/src/Kernel/Entity/EntityFieldValueTest.php
++++ b/modules/graphql_core/tests/src/Kernel/Entity/EntityFieldValueTest.php
+@@ -72,11 +72,6 @@ public function testBoolean() {
+       'entity_field_info',
+     ]);
+ 
+-    $metadata->addCacheContexts([
+-      'user.node_grants:view',
+-      'languages:language_interface',
+-    ]);
+-
+     $this->assertResults($query, [], [
+       'node' => [
+         'fieldBoolean' => TRUE,
+@@ -120,11 +115,6 @@ public function testText() {
+       'entity_field_info',
+     ]);
+ 
+-    $metadata->addCacheContexts([
+-      'user.node_grants:view',
+-      'languages:language_interface',
+-    ]);
+-
+     $this->assertResults($query, [], [
+       'node' => [
+         'fieldText' => [
+@@ -175,11 +165,6 @@ public function testFilteredText() {
+       'config:field.storage.node.body',
+       'entity_field_info',
+     ]);
+-    $metadata->addCacheContexts([
+-      'languages:language_interface',
+-    ]);
+-
+-    $metadata->addCacheContexts(['user.node_grants:view']);
+ 
+     $this->assertResults($query, [], [
+       'node' => [
+@@ -266,12 +251,6 @@ public function testRawValues($actualFieldValues, $expectedFieldValues) {
+       'file:2',
+     ]);
+ 
+-    $metadata->addCacheContexts([
+-      'languages:language_interface',
+-      'languages:language_content',
+-      'user.node_grants:view',
+-    ]);
+-
+     $this->assertResults($this->getQueryFromFile('raw_field_values.gql'), [
+       'path' => '/node/' . $node->id(),
+     ], [
+diff --git a/modules/graphql_core/tests/src/Kernel/Images/ImageFieldTest.php b/modules/graphql_core/tests/src/Kernel/Images/ImageFieldTest.php
+index 2d4286ce..5ef20707 100644
+--- a/modules/graphql_core/tests/src/Kernel/Images/ImageFieldTest.php
++++ b/modules/graphql_core/tests/src/Kernel/Images/ImageFieldTest.php
+@@ -64,12 +64,6 @@ public function testImageField() {
+       'node:1',
+     ]);
+ 
+-    $metadata->addCacheContexts([
+-      'user.node_grants:view',
+-      'languages:language_interface',
+-      'languages:language_content',
+-    ]);
+-
+     $this->assertResults($this->getQueryFromFile('image.gql'), [
+       'path' => '/node/' . $a->id(),
+     ], [
+diff --git a/modules/graphql_core/tests/src/Kernel/Languages/LanguageTest.php b/modules/graphql_core/tests/src/Kernel/Languages/LanguageTest.php
+index 158b8d5e..fdd95b71 100644
+--- a/modules/graphql_core/tests/src/Kernel/Languages/LanguageTest.php
++++ b/modules/graphql_core/tests/src/Kernel/Languages/LanguageTest.php
+@@ -108,11 +108,6 @@ public function testLanguageSwitchLinks() {
+       'config:language.entity.pt-br',
+     ]);
+ 
+-    $metadata->addCacheContexts([
+-      'languages:language_interface',
+-      'languages:language_url',
+-    ]);
+-
+     $this->assertResults($this->getQueryFromFile('language_switch_links.gql'), [], [
+       'route' => [
+         'links' => [
+diff --git a/modules/graphql_core/tests/src/Kernel/Menu/MenuTest.php b/modules/graphql_core/tests/src/Kernel/Menu/MenuTest.php
+index 7944f996..592de66c 100644
+--- a/modules/graphql_core/tests/src/Kernel/Menu/MenuTest.php
++++ b/modules/graphql_core/tests/src/Kernel/Menu/MenuTest.php
+@@ -78,11 +78,6 @@ public function testMenuTree() {
+       'config:system.menu.test',
+     ]);
+ 
+-    $metadata->addCacheContexts([
+-      "languages:language_interface",
+-      "languages:language_url",
+-    ]);
+-
+     $this->assertResults(
+       $this->getQueryFromFile('menu.gql'),
+       [],
+diff --git a/modules/graphql_core/tests/src/Kernel/Routing/RouteEntityTest.php b/modules/graphql_core/tests/src/Kernel/Routing/RouteEntityTest.php
+index 898ee54d..05740711 100644
+--- a/modules/graphql_core/tests/src/Kernel/Routing/RouteEntityTest.php
++++ b/modules/graphql_core/tests/src/Kernel/Routing/RouteEntityTest.php
+@@ -33,11 +33,6 @@ public function testRouteEntity() {
+       'node:1',
+     ]);
+ 
+-    $metadata->addCacheContexts([
+-      'user.node_grants:view',
+-      'languages:language_content',
+-    ]);
+-
+     $this->assertResults($query, $vars, [
+       'route' => [
+         'node' => [
+diff --git a/tests/src/Kernel/Framework/LanguageContextTest.php b/tests/src/Kernel/Framework/LanguageContextTest.php
+index cc212278..05e7c2a0 100644
+--- a/tests/src/Kernel/Framework/LanguageContextTest.php
++++ b/tests/src/Kernel/Framework/LanguageContextTest.php
+@@ -137,7 +137,7 @@ public function testRootLanguage() {
+ GQL;
+     $this->assertResults($query, [], [
+       'language' => \Drupal::languageManager()->getDefaultLanguage()->getId(),
+-    ], $this->defaultCacheMetaData()->addCacheContexts(['languages:language_interface']));
++    ], $this->defaultCacheMetaData());
+ 
+   }
+ 
+@@ -157,7 +157,7 @@ public function testInheritedLanguage() {
+       'edge' => [
+         'language' => 'fr',
+       ],
+-    ], $this->defaultCacheMetaData()->addCacheContexts(['languages:language_interface']));
++    ], $this->defaultCacheMetaData());
+   }
+ 
+   /**
+@@ -182,7 +182,7 @@ public function testOverriddenLanguage() {
+           'language' => 'en',
+         ],
+       ],
+-    ], $this->defaultCacheMetaData()->addCacheContexts(['languages:language_interface']));
++    ], $this->defaultCacheMetaData());
+   }
+ 
+   /**
+@@ -207,30 +207,4 @@ public function testUnawareField() {
+     ], $this->defaultCacheMetaData());
+   }
+ 
+-  /**
+-   * Test a field that is leaking cache contexts.
+-   *
+-   * If the field yields a cacheable result with language cache contexts but
+-   * it doesn't declare them, this indicates an error where the field might
+-   * not handle languages correctly.
+-   *
+-   * @expectedException \LogicException
+-   */
+-  public function testLeakingField() {
+-    $query = <<<GQL
+-query {
+-  edge(language: "fr") {
+-    leaking
+-  }
+-}
+-GQL;
+-
+-    // We expect a logic exception to be thrown.
+-    $this->assertResults($query, [], [
+-      'edge' => [
+-        'leaking' => 'leak',
+-      ],
+-    ], $this->defaultCacheMetaData());
+-  }
+-
+ }
+diff --git a/tests/src/Kernel/Framework/SecureFieldTest.php b/tests/src/Kernel/Framework/SecureFieldTest.php
+index 3ad92159..dad4e391 100644
+--- a/tests/src/Kernel/Framework/SecureFieldTest.php
++++ b/tests/src/Kernel/Framework/SecureFieldTest.php
+@@ -2,6 +2,8 @@
+ 
+ namespace Drupal\Tests\graphql\Kernel\Framework;
+ 
++use Drupal\Core\Cache\CacheableMetadata;
++use Drupal\graphql\GraphQL\Cache\CacheableValue;
+ use Drupal\Tests\graphql\Kernel\GraphQLTestBase;
+ 
+ /**
+@@ -32,13 +34,13 @@ protected function setUp() {
+       'name' => 'secure',
+       'type' => 'Boolean',
+       'secure' => TRUE,
+-    ], TRUE);
++    ], new CacheableValue(TRUE, [(new CacheableMetadata())->addCacheContexts(['user.permissions'])]));
+ 
+     $this->mockField('insecure', [
+       'name' => 'insecure',
+       'type' => 'Boolean',
+       'secure' => FALSE,
+-    ], TRUE);
++    ], new CacheableValue(TRUE, [(new CacheableMetadata())->addCacheContexts(['user.permissions'])]));
+   }
+ 
+   /**
+@@ -55,6 +57,7 @@ public function testSecureField() {
+    */
+   public function testInsecureField() {
+     $metadata = $this->defaultCacheMetaData();
++    $metadata->setCacheContexts([]);
+     $metadata->setCacheMaxAge(0);
+     $this->assertErrors('{ insecure }', [], [
+       'Unable to resolve insecure field \'insecure\'.',
