@@ -1,0 +1,78 @@
+From 9dd85290c95cd51a04c09ea0f2c2798bf7624a11 Mon Sep 17 00:00:00 2001
+From: David Thomas <david.thomas@scmp.com>
+Date: Wed, 9 May 2018 23:49:20 +1200
+Subject: [PATCH] #603 Use the languageManager to check for multilingual
+ configuration prior to language negotiation in the route field resolver.
+
+---
+ .../src/Plugin/GraphQL/Fields/Routing/Route.php       | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/modules/graphql_core/src/Plugin/GraphQL/Fields/Routing/Route.php b/modules/graphql_core/src/Plugin/GraphQL/Fields/Routing/Route.php
+index e10e9ab2..368a1ddb 100644
+--- a/modules/graphql_core/src/Plugin/GraphQL/Fields/Routing/Route.php
++++ b/modules/graphql_core/src/Plugin/GraphQL/Fields/Routing/Route.php
+@@ -8,6 +8,7 @@
+ use Drupal\graphql\GraphQL\Execution\ResolveContext;
+ use Drupal\graphql\Plugin\GraphQL\Fields\FieldPluginBase;
+ use Drupal\language\LanguageNegotiator;
++use Drupal\Core\Language\LanguageManagerInterface;
+ use GraphQL\Type\Definition\ResolveInfo;
+ use Symfony\Component\DependencyInjection\ContainerInterface;
+ use Symfony\Component\HttpFoundation\Request;
+@@ -42,6 +43,13 @@ class Route extends FieldPluginBase implements ContainerFactoryPluginInterface {
+    */
+   protected $languageNegotiator;
+ 
++  /**
++   * The language manager.
++   *
++   * @var \Drupal\Core\Language\LanguageManagerInterface
++   */
++  protected $languageManager;
++
+   /**
+    * {@inheritdoc}
+    */
+@@ -51,7 +59,8 @@ public static function create(ContainerInterface $container, array $configuratio
+       $plugin_id,
+       $plugin_definition,
+       $container->get('path.validator'),
+-      $container->has('language_negotiator') ? $container->get('language_negotiator') : NULL
++      $container->has('language_negotiator') ? $container->get('language_negotiator') : NULL,
++      $container->get('language_manager')
+     );
+   }
+ 
+@@ -68,17 +77,21 @@ public static function create(ContainerInterface $container, array $configuratio
+    *   The path validator service.
+    * @param \Drupal\language\LanguageNegotiator|null $languageNegotiator
+    *   The language negotiator.
++   * @param \Drupal\Core\Language\LanguageManagerInterface $languageManager
++   *   The language manager.
+    */
+   public function __construct(
+     array $configuration,
+     $pluginId,
+     $pluginDefinition,
+     PathValidatorInterface $pathValidator,
+-    $languageNegotiator
++    $languageNegotiator,
++    $languageManager
+   ) {
+     parent::__construct($configuration, $pluginId, $pluginDefinition);
+     $this->pathValidator = $pathValidator;
+     $this->languageNegotiator = $languageNegotiator;
++    $this->languageManager = $languageManager;
+   }
+ 
+   /**
+@@ -91,7 +104,7 @@ public function __construct(
+    */
+   public function resolve($value, array $args, ResolveContext $context, ResolveInfo $info) {
+     // For now we just take the "url" negotiator into account.
+-    if ($this->languageNegotiator) {
++    if ($this->languageManager->isMultilingual() && $this->languageNegotiator) {
+       if ($negotiator = $this->languageNegotiator->getNegotiationMethodInstance('language-url')) {
+         $context->setContext('language', $negotiator->getLangcode(Request::create($args['path'])), $info);
+       }
